@@ -83,7 +83,7 @@ async def analyze_image(file: UploadFile = File(...)):
     Returns structured JSON response.
     """
     try:
-        encoded_image, mime_type = encode_image_file(file)
+        encoded_image, mime_type = await encode_image_file(file)
 
         content_parts = [
             {
