@@ -1,5 +1,4 @@
 import base64
-import mimetypes
 import json
 import os
 from dotenv import load_dotenv
@@ -8,8 +7,6 @@ from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-# --- Configuration ---
-
 load_dotenv()
 
 client = OpenAI(
@@ -17,35 +14,40 @@ client = OpenAI(
     base_url="https://generativelanguage.googleapis.com/v1beta/openai/"
 )
 
-# --- FastAPI Setup ---
-
 app = FastAPI(title="Gemini Image Analyzer API", version="1.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allow all origins; change in production
+    allow_origins=["*"],  # allow all for dev; tighten in production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# --- Helper Function ---
-
-def encode_image_file(file: UploadFile):
-    """Encodes uploaded image to base64 and determines MIME type."""
+# --- Helper Function (async) ---
+async def encode_image_file(file: UploadFile):
+    """
+    Encodes uploaded image to base64 and returns (encoded_string, mime_type).
+    Uses UploadFile.read() which is async-safe.
+    """
     try:
         mime_type = file.content_type
         if not mime_type or not mime_type.startswith("image/"):
             raise HTTPException(status_code=400, detail="Uploaded file is not an image.")
 
-        file_bytes = file.file.read()
+        # Use async read provided by FastAPI's UploadFile
+        file_bytes = await file.read()
+        if not file_bytes:
+            raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+
         encoded_string = base64.b64encode(file_bytes).decode("utf-8")
         return encoded_string, mime_type
+
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error processing file: {e}")
 
-
-# --- System Prompt ---
 
 system_prompt = """
 You are a helpful AI Assistant specialized in analyzing images.
@@ -73,58 +75,76 @@ Rules:
 Return the result as JSON with a single key 'Conclusion' containing the full analysis.
 """
 
-# --- API Endpoint ---
-
 @app.post("/analysis")
 async def analyze_image(file: UploadFile = File(...)):
     """
     Upload an image for AI analysis.
-    The image can be either food or a medical prescription.
-    Returns structured JSON response.
+    POST /analysis
     """
     try:
         encoded_image, mime_type = await encode_image_file(file)
 
-        content_parts = [
-            {
-                "type": "image_url",
-                "image_url": {
-                    "url": f"data:{mime_type};base64,{encoded_image}"
-                }
-            },
-            {
-                "type": "text",
-                "text": "Analyze this image according to the system prompt's instructions and provide the result as JSON."
-            }
-        ]
+        # Build message content — keep it simple: system prompt and a user instruction.
+        # Put the image as a data URI in the user content.
+        user_text = (
+            "Analyze this image according to the system prompt's instructions and "
+            "provide the result as JSON with a top-level key 'Conclusion'."
+        )
 
-        message = [
+        # Messages structure may depend on the SDK; keep same general shape you had.
+        messages = [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": content_parts},
+            {
+                "role": "user",
+                "content": json.dumps({
+                    "note": user_text,
+                    "image_data_uri": f"data:{mime_type};base64,{encoded_image}"
+                })
+            },
         ]
 
+        # Call the client — wrap in try/except and return helpful debug if things go wrong
         response = client.chat.completions.create(
             model="gemini-2.5-flash",
             response_format={"type": "json_object"},
             temperature=0.1,
-            messages=message
+            messages=messages
         )
 
-        response_content = response.choices[0].message.content
-        parsed_output = json.loads(response_content)
+        # Attempt to extract text content (structure depends on SDK/response)
+        try:
+            # this is what your code expected
+            response_content = response.choices[0].message.content
+        except Exception:
+            # fallback: stringify response for debugging
+            response_content = getattr(response, "text", None) or json.dumps(response, default=str)
+
+        # Try parse as JSON
+        try:
+            parsed_output = json.loads(response_content)
+        except Exception:
+            # If the model didn't return strict JSON, return raw text for debugging
+            return JSONResponse(
+                status_code=502,
+                content={
+                    "status": "error",
+                    "detail": "AI response was not valid JSON.",
+                    "ai_raw": response_content
+                }
+            )
 
         if "Conclusion" in parsed_output:
             return JSONResponse(content={"status": "success", "data": parsed_output["Conclusion"]})
         else:
             return JSONResponse(content={"status": "partial", "raw": parsed_output})
 
-    except json.JSONDecodeError:
-        raise HTTPException(status_code=500, detail="Invalid JSON response from AI.")
+    except HTTPException as he:
+        # re-raise HTTPExceptions with their message/status
+        raise he
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        # log / return helpful message
+        raise HTTPException(status_code=500, detail=f"Server error: {e}")
 
-
-# --- Root Route ---
 
 @app.get("/")
 def home():
